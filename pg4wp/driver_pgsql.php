@@ -25,12 +25,9 @@
 	$GLOBALS['pg4wp_last_insert'] = '';
 	$GLOBALS['pg4wp_connstr'] = '';
 	$GLOBALS['pg4wp_conn'] = false;
-	
 
-	function wpsql_ping($conn) {
-		return(pg_ping($conn));
-	}
-
+	function wpsql_ping($conn)
+		{ return pg_ping($conn); }
 	function wpsql_num_rows($result)
 		{ return pg_num_rows($result); }
 	function wpsql_numrows($result)
@@ -66,7 +63,6 @@
 		{ return pg_fetch_result($result, $i, $fieldname); }
 ****/
 
-	// This is a fake connection except during installation
 	function wpsql_connect($dbserver, $dbuser, $dbpass)
 	{
 		$GLOBALS['pg4wp_connstr'] = '';
@@ -83,8 +79,10 @@
 			wp_die( 'Connecting to your PostgreSQL database without a password is considered insecure.
 					<br />If you want to do it anyway, please set "PG4WP_INSECURE" to true in your "db.php" file.' );
 
-		// as of WordPress 4.6, a true resource must be returned
-		return pg_connect( $GLOBALS['pg4wp_connstr'].' dbname=template1');
+		// PostgreSQL must connect to a specific database (unlike MySQL)
+		// Guess at one here and reconnect as required in wpsql_select_db
+		$dbname = defined('DB_NAME') && DB_NAME ? DB_NAME : 'template1';
+		return pg_connect( $GLOBALS['pg4wp_connstr'].' dbname='.$dbname);
 	}
 	
 	// The effective connection happens here
@@ -92,6 +90,7 @@
 	{
 		$pg_connstr = $GLOBALS['pg4wp_connstr'].' dbname='.$dbname;
 
+		// Note:  pg_connect returns existing connection for same connstr
 		$GLOBALS['pg4wp_conn'] = pg_connect($pg_connstr);
 		
 		if( $GLOBALS['pg4wp_conn'])
@@ -328,6 +327,10 @@
 			if( isset($wpdb) && false !== strpos( $sql, $wpdb->comments))
 				$sql = str_replace(' comment_id ', ' comment_ID ', $sql);
 
+			// another hack for Akismet
+			$sql = str_replace('INNER JOIN wp_comments as c USING(comment_id)', 'INNER JOIN wp_comments as c on c.comment_ID = m.comment_id', $sql);
+			//
+			//
 			// MySQL allows integers to be used as boolean expressions
 			// where 0 is false and all other values are true.
 			//
@@ -412,10 +415,14 @@
 			}
 			elseif( 0 === strpos($sql, 'INSERT IGNORE'))
 			{
-				// Note:  Requires PostgreSQL 9.0 and USAGE privilege.
-				// Could do query-specific rewrite using SELECT without FROM
-				// as in http://stackoverflow.com/a/13342031
-				$sql = 'DO $$BEGIN INSERT'.substr($sql, 13).'; EXCEPTION WHEN unique_violation THEN END;$$;';
+				if (strpos($sql, 'core_updater.lock') !== false) {
+					$sql = preg_replace('/IGNORE/', '', $sql);
+				}else {
+					// Note:  Requires PostgreSQL 9.0 and USAGE privilege.
+					// Could do query-specific rewrite using SELECT without FROM
+					// as in http://stackoverflow.com/a/13342031
+					$sql = 'DO $$BEGIN INSERT'.substr($sql, 13).'; EXCEPTION WHEN unique_violation THEN END;$$;';
+				}
 			}
 			
 			// To avoid Encoding errors when inserting data coming from outside
@@ -444,8 +451,13 @@
 			}
 
 			// LIMIT is not allowed in DELETE queries
-			$sql = str_replace( 'LIMIT 1', '', $sql);
+			//$sql = str_replace( 'LIMIT 1', '', $sql);
+			$sql = preg_replace( '/ORDER[ ]+BY[ ]+[^\s]+/i', '', $sql);
+			$sql = preg_replace( '/LIMIT[ ]+\d+/i', '', $sql);
 			$sql = str_replace( ' REGEXP ', ' ~ ', $sql);
+
+			// Handle CAST( ... AS UNSIGNED)
+			$sql = preg_replace( '/CAST[ ]*\((.+)[ ]+AS[ ]+UNSIGNED[ ]*\)/', 'CAST($1 AS INTEGER)', $sql);
 			
 			// This handles removal of duplicate entries in table options
 			if( false !== strpos( $sql, 'DELETE o1 FROM '))
@@ -475,6 +487,15 @@
 		{
 			$logto = 'SHOWTABLES';
 			$sql = 'SELECT tablename FROM pg_tables WHERE schemaname = \'public\';';
+		}
+		// Fix utf8mb4 conversion list
+		elseif( 0 === strpos($sql, 'SHOW FULL COLUMNS FROM '))
+		{
+		//	$logto = 'SHOWTABLES';
+		//	$sql = 'select NULL';
+			$logto = 'SHOWTABLES';
+			$sql = str_replace( 'SHOW FULL COLUMNS FROM ', 'SELECT column_name FROM information_schema.columns WHERE table_name = ', $sql);
+			$sql = str_replace( '`', "'", $sql );
 		}
 		// Rewriting optimize table
 		elseif( 0 === strpos($sql, 'OPTIMIZE TABLE'))
